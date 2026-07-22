@@ -10,6 +10,8 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_search_food` | Read | Search the MyFitnessPal food database |
 | `mfp_get_food_details` | Read | Get detailed nutrition info for a food item |
 | `mfp_add_food_to_diary` | Write | Add a food item to your diary for a specific meal and date |
+| `mfp_list_recent_entries` | Read | List diary entries logged through this server (and so deletable) |
+| `mfp_delete_food_entry` | Write | Delete a diary entry that this server logged |
 | `mfp_get_measurements` | Read | Get weight/body measurement history |
 | `mfp_set_measurement` | Write | Log a new weight or body measurement |
 | `mfp_get_exercises` | Read | Get logged exercises (cardio & strength) |
@@ -20,9 +22,37 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_get_report` | Read | Get nutrition reports over a date range |
 | `refresh_browser_cookies` | Utility | Extract and save session cookies from browser |
 
+## How diary writes work
+
+MyFitnessPal has no public API. Reads here are scraped from the website via
+[`python-myfitnesspal`](https://github.com/coddingtonbear/python-myfitnesspal), and **diary
+writes go through MFP's internal v2 JSON API** — the same one their web client uses,
+authenticated with your existing session token.
+
+That interface is undocumented and was determined by observing the web client. It works today,
+but MyFitnessPal can change it without notice. They have already done so once: this server
+originally posted to `/food/diary/{user}/add`, which now returns 404, leaving food logging
+broken. If logging starts failing, that is the most likely cause.
+
+### Deleting entries
+
+MyFitnessPal returns an entry's ID **only in the response that creates it**. The diary page
+exposes a different, legacy numeric ID that the delete endpoint rejects, and the API's diary
+read returns meal-level totals with no per-entry IDs.
+
+So this server records the IDs of entries it creates, in `~/.mfp_mcp/entries.json`. The practical
+consequence:
+
+- Entries logged **through this server** can be listed and deleted here
+- Entries logged **in the MyFitnessPal app or website** cannot — delete those where you made them
+
 ## Prerequisites
 
-- **Python 3.10+** (check with `python3 --version`)
+- **Python 3.10–3.12** (check with `python3 --version`)
+
+  Not 3.13+: `lxml`, pulled in by `myfitnesspal`, has no wheels for it and fails to build
+  against the 3.14 C API. On macOS, `brew install python@3.12`.
+
 - **pip 21.3+** (for pyproject.toml support; upgrade with `pip install --upgrade pip`)
 - **MyFitnessPal account**
 - **One of the following for authentication:**
@@ -186,11 +216,24 @@ If no credentials are provided and no stored cookies exist, the server falls bac
 
 ## Security Note on Credentials
 
-Your MyFitnessPal credentials in the Claude Desktop config are stored locally on your machine. The config file is only readable by your user account. However, if you're concerned about storing credentials:
+Storing `MFP_PASSWORD` in your MCP client config puts your MyFitnessPal password in **plaintext
+on disk**, readable by anything running as your user. It is convenient — the server can
+re-authenticate indefinitely — but it is a real tradeoff, not a formality.
 
-1. Use Option B (browser cookies) instead
-2. Or use a dedicated MyFitnessPal account for API access
-3. Session cookies are stored in `~/.mfp_mcp/cookies.json` with restricted permissions
+Prefer browser-cookie auth if you would rather not store the password: log into
+myfitnesspal.com and the server reads the session from your browser. The cost is that MFP
+sessions expire, so you will occasionally need to log in again.
+
+Files this server writes to `~/.mfp_mcp/` (directory mode `0700`):
+
+| File | Contents | Mode |
+|------|----------|------|
+| `cookies.json` | Session cookies — full account access, treat as a password | `0600` |
+| `entries.json` | IDs of entries logged here, so they can be deleted | `0600` |
+
+Note that this server can **modify your diary** — adding and deleting food entries, and updating
+goals, measurements, and water. Deletion is limited to entries it created (see above), so it
+cannot remove data logged in the app.
 
 ## Usage Examples
 
@@ -201,6 +244,14 @@ Once configured, you can interact with your MyFitnessPal data through Claude:
 "Show me what I ate today"
 "Get my food diary for 2026-01-05"
 "What meals did I log yesterday?"
+```
+
+### Logging and Correcting Food
+```
+"Log a grilled chicken breast, 6 oz, for lunch"
+"Add 2 cups of oatmeal to breakfast"
+"What have I logged through you today?"
+"Delete that chicken breast I just logged"
 ```
 
 ### Track Weight Progress
@@ -471,8 +522,14 @@ Get nutrition report over a date range.
 
 MIT License - See [LICENSE](LICENSE) file for details.
 
+This is a derivative work of
+[AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt/myfitnesspal-mcp-python),
+Copyright (c) 2026 Adam, used under the MIT License. It adds v2 API diary writes (replacing the
+removed endpoint), entry deletion, and tests.
+
 ## Acknowledgments
 
+- [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt/myfitnesspal-mcp-python) - The original MCP server this builds on
 - [python-myfitnesspal](https://github.com/coddingtonbear/python-myfitnesspal) - The underlying library for MyFitnessPal access
 - [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) - Model Context Protocol framework
 - [Anthropic](https://anthropic.com) - Claude and the MCP specification

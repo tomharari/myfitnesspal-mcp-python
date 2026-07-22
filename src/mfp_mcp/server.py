@@ -42,6 +42,16 @@ mcp = FastMCP("myfitnesspal_mcp")
 CONFIG_DIR = Path.home() / ".mfp_mcp"
 COOKIES_FILE = CONFIG_DIR / "cookies.json"
 
+# MyFitnessPal's v2 JSON API, used for diary writes. The legacy HTML form
+# endpoint (/food/diary/{user}/add) was removed by MFP and now returns 404.
+MFP_API_BASE = "https://api.myfitnesspal.com"
+MFP_CLIENT_ID = "mfp-main-js"
+VALID_MEALS = ("Breakfast", "Lunch", "Dinner", "Snacks")
+
+# Entries created by this server, recorded so they can be deleted later.
+ENTRIES_FILE = CONFIG_DIR / "entries.json"
+MAX_REMEMBERED_ENTRIES = 500
+
 
 # ============================================================================
 # Authentication Helper Functions
@@ -51,6 +61,7 @@ COOKIES_FILE = CONFIG_DIR / "cookies.json"
 def ensure_config_dir():
     """Ensure the config directory exists."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.chmod(0o700)
 
 
 def save_cookies(cookies: Dict[str, str]):
@@ -67,6 +78,8 @@ def save_cookies(cookies: Dict[str, str]):
     }
     with open(COOKIES_FILE, "w") as f:
         json.dump(cookie_data, f, indent=2)
+    # Session cookies grant full account access - restrict to owner only
+    COOKIES_FILE.chmod(0o600)
     logger.info(f"Saved session cookies to {COOKIES_FILE}")
 
 
@@ -667,6 +680,35 @@ class AddFoodToDiaryInput(BaseModel):
     )
 
 
+class DeleteFoodEntryInput(BaseModel):
+    """Input model for deleting a food diary entry."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    entry_id: str = Field(
+        ...,
+        description=(
+            "Entry ID returned when the food was logged, as listed by "
+            "mfp_list_recent_entries. Only entries created through this server "
+            "can be deleted; entries logged in the MyFitnessPal app must be "
+            "deleted in the app."
+        ),
+        min_length=1,
+    )
+
+
+class ListRecentEntriesInput(BaseModel):
+    """Input model for listing deletable diary entries."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    date: Optional[str] = Field(
+        default=None,
+        description="Only list entries for this date (YYYY-MM-DD). Omit for all dates.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+
+
 class SetWaterInput(BaseModel):
     """Input model for setting water intake."""
 
@@ -690,105 +732,267 @@ class SetWaterInput(BaseModel):
 # ============================================================================
 
 
+def load_entry_log() -> Dict[str, Any]:
+    """Load the local record of entries created by this server."""
+    if not ENTRIES_FILE.exists():
+        return {}
+    try:
+        with open(ENTRIES_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        logger.warning(f"Could not read entry log: {e}")
+        return {}
+
+
+def remember_entry(entry_id: str, date: str, meal: str, description: str) -> None:
+    """
+    Record an entry this server created so it can be deleted later.
+
+    MyFitnessPal only reveals an entry's UUID in the response that creates it;
+    the diary page exposes a different, legacy numeric id that the v2 delete
+    endpoint rejects. Without this record, entries are effectively permanent
+    from the server's point of view.
+    """
+    entries = load_entry_log()
+    entries[entry_id] = {"date": date, "meal": meal, "description": description}
+
+    # Keep the log from growing without bound; recent entries are the ones
+    # a user realistically corrects.
+    if len(entries) > MAX_REMEMBERED_ENTRIES:
+        for stale in sorted(entries, key=lambda k: entries[k]["date"])[
+            : len(entries) - MAX_REMEMBERED_ENTRIES
+        ]:
+            del entries[stale]
+
+    ensure_config_dir()
+    with open(ENTRIES_FILE, "w") as f:
+        json.dump(entries, f, indent=2)
+    ENTRIES_FILE.chmod(0o600)
+
+
+def forget_entry(entry_id: str) -> None:
+    """Drop an entry from the local record after it has been deleted."""
+    entries = load_entry_log()
+    if entries.pop(entry_id, None) is not None:
+        ensure_config_dir()
+        with open(ENTRIES_FILE, "w") as f:
+            json.dump(entries, f, indent=2)
+        ENTRIES_FILE.chmod(0o600)
+
+
+def delete_diary_entry(client, entry_id: str) -> None:
+    """
+    Delete a diary entry by its MyFitnessPal UUID.
+
+    Only entries created through this server can be deleted, because MFP does
+    not expose entry UUIDs anywhere else. Entries logged in the MyFitnessPal
+    app must be deleted there.
+
+    Args:
+        client: Authenticated myfitnesspal.Client instance
+        entry_id: The entry's UUID, as recorded at creation time
+
+    Raises:
+        RuntimeError: If the entry is unknown or the delete fails
+    """
+    response = client.session.delete(
+        f"{MFP_API_BASE}/v2/diary/{entry_id}",
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+
+    if response.status_code == 404:
+        raise RuntimeError(
+            f"MyFitnessPal has no entry {entry_id}. It may already be deleted, "
+            "or it was logged in the MyFitnessPal app rather than through this "
+            "server - app entries must be deleted in the app."
+        )
+    if response.status_code not in (200, 204):
+        raise RuntimeError(
+            f"Failed to delete entry {entry_id}: HTTP {response.status_code}"
+        )
+
+    forget_entry(entry_id)
+    logger.info(f"Deleted diary entry {entry_id}")
+
+
+def _mfp_api_headers(client, json_body: bool = False) -> Dict[str, str]:
+    """
+    Build auth headers for MyFitnessPal's v2 JSON API.
+
+    The v2 API backs the current MFP web client. It requires the session's
+    OAuth bearer token plus an mfp-client-id identifying the calling client.
+    """
+    headers = {
+        "Authorization": f"Bearer {client.access_token}",
+        "mfp-client-id": MFP_CLIENT_ID,
+        "mfp-user-id": str(client.user_id),
+        "Accept": "application/json",
+    }
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def get_food_v2(client, mfp_id: str) -> Dict[str, Any]:
+    """
+    Fetch a food's full v2 record, including its version and serving sizes.
+
+    The diary API rejects entries whose food version does not match the
+    current stored version, so this must be read fresh rather than cached.
+
+    Args:
+        client: Authenticated myfitnesspal.Client instance
+        mfp_id: MyFitnessPal food item ID
+
+    Returns:
+        The food object as returned by the v2 API
+
+    Raises:
+        RuntimeError: If the food cannot be retrieved
+    """
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/foods",
+        params={"ids": str(mfp_id)},
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Could not look up food {mfp_id}: HTTP {response.status_code}"
+        )
+
+    items = response.json().get("items") or []
+    if not items:
+        raise RuntimeError(f"No food found with ID {mfp_id}")
+    return items[0]
+
+
+def select_serving_size(food: Dict[str, Any], unit: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Choose which of a food's serving sizes to log against.
+
+    Args:
+        food: Food object from get_food_v2
+        unit: Optional unit to match (e.g. "oz", "medium breast"). Matching is
+            case-insensitive and accepts a substring. Falls back to the food's
+            default (first) serving size when omitted or unmatched.
+
+    Returns:
+        The serving size dict, trimmed to the fields the diary API permits
+
+    Raises:
+        RuntimeError: If the food declares no serving sizes
+    """
+    serving_sizes = food.get("serving_sizes") or []
+    if not serving_sizes:
+        raise RuntimeError(f"Food {food.get('id')} has no serving sizes")
+
+    chosen = serving_sizes[0]
+    if unit:
+        wanted = unit.strip().lower()
+        for size in serving_sizes:
+            size_unit = str(size.get("unit", "")).lower()
+            if size_unit == wanted or wanted in size_unit:
+                chosen = size
+                break
+        else:
+            logger.warning(
+                f"Unit {unit!r} not found for food {food.get('id')}; "
+                f"using default serving {chosen.get('unit')!r}"
+            )
+
+    # The diary endpoint rejects any serving_size field beyond these three.
+    return {
+        "value": chosen["value"],
+        "unit": chosen["unit"],
+        "nutrition_multiplier": chosen["nutrition_multiplier"],
+    }
+
+
 def add_food_to_diary(
     client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: Optional[str] = None
-) -> None:
+) -> Optional[str]:
     """
     Add a food item to the diary for a specific date and meal.
-    
+
     Args:
         client: Authenticated myfitnesspal.Client instance
         mfp_id: MyFitnessPal food item ID
         meal: Meal name (Breakfast, Lunch, Dinner, Snacks)
         target_date: Date to add the food entry
         quantity: Number of servings (default 1.0)
-        unit: Optional unit/serving size description
-    
+        unit: Optional serving unit to log against (e.g. "oz")
+
+    Returns:
+        The new entry's UUID, or None if MFP did not return one
+
     Raises:
         RuntimeError: If the operation fails
     """
-    from urllib import parse
-    
+    food = get_food_v2(client, mfp_id)
+    serving_size = select_serving_size(food, unit)
+
+    meal_name = meal.strip().capitalize()
+    if meal_name not in VALID_MEALS:
+        raise RuntimeError(
+            f"Invalid meal {meal!r}. Expected one of: {', '.join(VALID_MEALS)}"
+        )
+
+    entry = {
+        "type": "food_entry",
+        "date": target_date.strftime("%Y-%m-%d"),
+        "meal_name": meal_name,
+        "servings": float(quantity),
+        "food": {"id": str(food["id"]), "version": str(food["version"])},
+        "serving_size": serving_size,
+    }
+
+    response = client.session.post(
+        f"{MFP_API_BASE}/v2/diary",
+        headers=_mfp_api_headers(client, json_body=True),
+        data=json.dumps({"items": [entry]}),
+        timeout=30,
+    )
+
+    if response.status_code not in (200, 201):
+        detail = ""
+        try:
+            body = response.json()
+            detail = body.get("error_details", {}).get("item_error") or body.get(
+                "error_description", ""
+            )
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Failed to add food to diary: HTTP {response.status_code}"
+            + (f" - {detail}" if detail else "")
+        )
+
+    logger.info(
+        f"Added food {mfp_id} ({serving_size['value']} {serving_size['unit']} "
+        f"x{quantity}) to {meal_name} for {target_date}"
+    )
+
+    # MFP returns the new entry's UUID here and nowhere else - the diary page
+    # exposes only legacy numeric ids, which /v2/diary/{id} rejects. Record it
+    # now or the entry can never be deleted through this server.
+    entry_id = None
     try:
-        # Get the diary page for the target date to extract CSRF token
-        # Use the same method the library uses
-        date_str = target_date.strftime("%Y-%m-%d")
-        diary_url = parse.urljoin(
-            client.BASE_URL_SECURE,
-            f"food/diary/{client.effective_username}?date={date_str}"
+        entry_id = response.json()["items"][0]["id"]
+    except (ValueError, KeyError, IndexError):
+        logger.warning("Entry created but no id returned; it will not be deletable")
+
+    if entry_id:
+        remember_entry(
+            entry_id,
+            date=target_date.strftime("%Y-%m-%d"),
+            meal=meal_name,
+            description=f"{food.get('description', mfp_id)}, "
+            f"{quantity:g} x {serving_size['value']:g} {serving_size['unit']}",
         )
-        
-        # Use the library's method to get the document
-        document = client._get_document_for_url(diary_url)
-        
-        # Extract authenticity token (same way the library does)
-        authenticity_token = document.xpath(
-            "(//input[@name='authenticity_token']/@value)[1]"
-        )
-        if not authenticity_token:
-            raise RuntimeError("Could not find authenticity token on diary page")
-        authenticity_token = authenticity_token[0]
-        
-        # Map meal names to meal indices (0=Breakfast, 1=Lunch, 2=Dinner, 3=Snacks)
-        meal_map = {
-            "breakfast": "0",
-            "lunch": "1",
-            "dinner": "2",
-            "snacks": "3",
-            "snack": "3",
-        }
-        meal_index = meal_map.get(meal.lower(), "0")
-        
-        # Build the URL for adding food
-        # MyFitnessPal uses /food/diary/{username}/add endpoint
-        add_food_url = parse.urljoin(
-            client.BASE_URL_SECURE,
-            f"food/diary/{client.effective_username}/add"
-        )
-        
-        # Prepare the data for the POST request
-        # Format matches what MyFitnessPal expects based on their form submissions
-        post_data = {
-            "authenticity_token": authenticity_token,
-            "date": date_str,
-            "meal": meal_index,
-            "food_id": mfp_id,
-            "quantity": str(quantity),
-        }
-        
-        if unit:
-            post_data["unit"] = unit
-        
-        # Add food to diary
-        headers = {
-            "Referer": diary_url,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        
-        response = client.session.post(add_food_url, data=post_data, headers=headers)
-        response.raise_for_status()
-        
-        # Check response content for errors
-        if response.status_code != 200:
-            raise RuntimeError(f"Failed to add food: HTTP {response.status_code}")
-        
-        # MyFitnessPal might return success even with errors in content
-        # Log error indication without exposing full response content (may contain sensitive data)
-        content = response.text if hasattr(response, 'text') else response.content.decode('utf-8', errors='ignore')
-        if 'error' in content.lower() and 'success' not in content.lower():
-            logger.warning("Possible error in response from MyFitnessPal API")
-        
-        logger.info(f"Successfully added food {mfp_id} to {meal} for {target_date}")
-        
-    except Exception as e:
-        # Don't expose internal error details to avoid leaking sensitive information
-        error_msg = str(e)
-        # Only include safe error information
-        if "HTTP" in error_msg or "status" in error_msg.lower():
-            raise RuntimeError(f"Failed to add food to diary: {error_msg}")
-        else:
-            raise RuntimeError("Failed to add food to diary. Please check your authentication and try again.")
+
+    return entry_id
 
 
 def set_water_intake(client, target_date: date, cups: float) -> None:
@@ -1400,7 +1604,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             meal = "Snacks"
         
         # Add food to diary
-        add_food_to_diary(
+        entry_id = add_food_to_diary(
             client=client,
             mfp_id=params.mfp_id,
             meal=meal,
@@ -1408,30 +1612,131 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             quantity=params.quantity,
             unit=params.unit,
         )
-        
-        # Get food details for confirmation
-        try:
-            food_item = client.get_food_item_details(params.mfp_id)
-            food_name = getattr(food_item, "description", "Unknown Food")
-        except:
-            food_name = "Food item"
-        
+
+        # add_food_to_diary already fetched the food to get its version, and
+        # recorded a description alongside the entry id - reuse that rather
+        # than making a second round trip for the name.
+        logged = load_entry_log().get(entry_id, {})
+
         return json.dumps(
             {
                 "success": True,
-                "message": f"Successfully added {food_name} to {meal}",
+                "message": f"Successfully added {logged.get('description', 'food')} to {meal}",
+                "entry_id": entry_id,
                 "date": str(target_date),
                 "meal": meal,
                 "food_id": params.mfp_id,
-                "food_name": food_name,
                 "quantity": params.quantity,
                 "unit": params.unit,
+                "note": (
+                    None
+                    if entry_id
+                    else "MyFitnessPal did not return an entry id; this entry "
+                    "cannot be deleted through this server."
+                ),
             },
             indent=2,
         )
         
     except Exception as e:
         return f"Error adding food to diary: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_list_recent_entries",
+    annotations={
+        "title": "List Deletable Diary Entries",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def mfp_list_recent_entries(params: ListRecentEntriesInput) -> str:
+    """
+    List food diary entries that were logged through this server and can be deleted.
+
+    MyFitnessPal only reveals an entry's ID at the moment it is created, so this
+    server records the IDs of entries it logs. Entries added in the MyFitnessPal
+    app do not appear here and must be deleted in the app.
+
+    Args:
+        params: ListRecentEntriesInput containing:
+            - date (str, optional): Only list entries for this date (YYYY-MM-DD)
+
+    Returns:
+        str: JSON list of entries with their IDs, dates, meals, and descriptions
+    """
+    try:
+        entries = load_entry_log()
+
+        listed = [
+            {"entry_id": entry_id, **details}
+            for entry_id, details in entries.items()
+            if params.date is None or details.get("date") == params.date
+        ]
+        listed.sort(key=lambda e: e.get("date", ""), reverse=True)
+
+        return json.dumps(
+            {
+                "count": len(listed),
+                "entries": listed,
+                "note": (
+                    "Only entries logged through this server are listed. Entries "
+                    "added in the MyFitnessPal app must be deleted in the app."
+                ),
+            },
+            indent=2,
+        )
+
+    except Exception as e:
+        return f"Error listing entries: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_delete_food_entry",
+    annotations={
+        "title": "Delete Food Diary Entry",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_delete_food_entry(params: DeleteFoodEntryInput) -> str:
+    """
+    Delete a food entry from your MyFitnessPal diary.
+
+    Use mfp_list_recent_entries to find the entry_id. Only entries logged through
+    this server can be deleted - MyFitnessPal does not expose IDs for entries
+    created elsewhere, so entries added in the app must be deleted in the app.
+
+    Args:
+        params: DeleteFoodEntryInput containing:
+            - entry_id (str): The entry's ID, from mfp_list_recent_entries
+
+    Returns:
+        str: Confirmation of the deleted entry
+    """
+    try:
+        client = get_mfp_client()
+        deleted = load_entry_log().get(params.entry_id, {})
+
+        delete_diary_entry(client, params.entry_id)
+
+        return json.dumps(
+            {
+                "success": True,
+                "message": f"Deleted {deleted.get('description', 'entry')}"
+                + (f" from {deleted['meal']}" if deleted.get("meal") else ""),
+                "entry_id": params.entry_id,
+                "date": deleted.get("date"),
+            },
+            indent=2,
+        )
+
+    except Exception as e:
+        return f"Error deleting entry: {str(e)}"
 
 
 @mcp.tool(
